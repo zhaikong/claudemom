@@ -5,3 +5,4 @@ crates/claude-local/runtime/.cache/
 crates/claude-local/runtime/mock/
 crates/claude-local/runtime/vendor/
 .DS_Store
+config.bat

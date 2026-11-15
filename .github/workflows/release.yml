@@ -1,10 +1,16 @@
-# 推 v* tag 触发：构建 macOS（通用二进制）与 Windows 安装包，建 GitHub Release 并上传，
-# 同时生成自动更新用的 latest.json（更新包用 TAURI_SIGNING_PRIVATE_KEY 签名）。
+name: Release
+
+# 发版入口是推送 v* tag（本地用 `node scripts/release.mjs <版本号>`）：
+#   prepare  校验版本号文件与 tag 一致，从 CHANGELOG.md 截取说明，建草稿 Release
+#   构建     Windows / macOS 并行构建，附件传到草稿
+#   收尾     生成 SHA256SUMS.txt 与自动更新用的 latest.json，附件齐了才公开发布
+# 草稿期间用户看不到这一版，某个平台失败也不会让「检查更新」读到缺附件的 Latest。
+# 补跑某个平台用 workflow_dispatch。
 #
-# macOS 正式签名 + 公证：配了下面这些 Secret 就启用（与 CodexPlusPlus 同名同值），没配就是 ad-hoc 签名。
+# 签名：更新包用 TAURI_SIGNING_PRIVATE_KEY(_PASSWORD)；macOS 正式签名 + 公证用下面这些 Secret
+# （与 CodexPlusPlus 同名同值），缺任何一个就失败，不发未签名的包：
 #   MACOS_CERT_P12（base64）、MACOS_CERT_PASSWORD、MACOS_SIGNING_IDENTITY、
 #   APPLE_API_KEY_P8（base64）、APPLE_API_KEY_ID、APPLE_API_ISSUER_ID
-name: Release
 
 on:
   push:
@@ -12,48 +18,149 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "要补跑的 tag（如 v0.2.0）"
+        description: "已存在的版本标签，例如 v0.1.4"
         required: true
+        type: string
+      platform:
+        description: "需要重新构建的平台"
+        default: all
+        type: choice
+        options:
+          - all
+          - windows
+          - macos
+      publish:
+        description: "Release 还是草稿时，附件与更新元数据齐备后公开发布"
+        default: false
+        type: boolean
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 permissions:
   contents: write
 
-jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: macos-latest
-            args: --target universal-apple-darwin
-          - platform: windows-latest
-            args: ""
-    runs-on: ${{ matrix.platform }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.tag || github.ref }}
+# 同一个 tag 的两轮不要并发上传附件。
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
-      - name: 读版本与发布说明
-        id: meta
+jobs:
+  prepare:
+    name: Prepare draft Release
+    runs-on: ubuntu-latest
+    outputs:
+      is_draft: ${{ steps.release.outputs.is_draft }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Verify version files match tag
+        # 只拦推 tag 的新发版；补跑旧 tag 时那一版可能还没有这些文件或校验脚本。
+        if: github.event_name == 'push'
+        run: node scripts/release-meta.mjs check "$RELEASE_TAG"
+
+      - name: Prepare release notes
         shell: bash
         run: |
-          tag="${{ inputs.tag || github.ref_name }}"
-          version="${tag#v}"
-          app_version=$(node -p "require('./apps/claude-mom/src-tauri/tauri.conf.json').version")
-          if [ "$version" != "$app_version" ]; then
-            echo "tag $tag 与 tauri.conf.json 的版本 $app_version 不一致" >&2
-            exit 1
+          set -euo pipefail
+          if ! node scripts/release-meta.mjs notes "$RELEASE_TAG" > notes.md; then
+            echo "::warning::CHANGELOG.md 里没有 ${RELEASE_TAG#v} 这一节，改用 GitHub 自动生成的说明"
+            gh api "repos/$GH_REPO/releases/generate-notes" -f tag_name="$RELEASE_TAG" --jq .body > notes.md
           fi
-          # CHANGELOG.md 里本版本那一节原样作为 Release 说明。
-          notes=$(awk -v v="$version" '$0 ~ "^## "v" " {f=1; next} /^## / && f {exit} f' CHANGELOG.md)
-          {
-            echo "tag=$tag"
-            echo "version=$version"
-            echo "notes<<__NOTES__"
-            echo "${notes:-ClaudeMom $version}"
-            echo "__NOTES__"
-          } >> "$GITHUB_OUTPUT"
+          cat notes.md
+
+      - name: Create or update draft Release
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          state=$(gh release view "$RELEASE_TAG" --json isDraft -q .isDraft 2>/dev/null || echo missing)
+          case "$state" in
+            missing)
+              gh release create "$RELEASE_TAG" --draft --verify-tag --title "ClaudeMom $RELEASE_TAG" --notes-file notes.md
+              echo "is_draft=true" >> "$GITHUB_OUTPUT"
+              ;;
+            true)
+              # 事先手动建好的草稿：推 tag 时以 CHANGELOG 为准刷新说明；补跑时保留手改过的说明。
+              if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+                gh release edit "$RELEASE_TAG" --tag "$RELEASE_TAG" --verify-tag --title "ClaudeMom $RELEASE_TAG" --notes-file notes.md
+              fi
+              echo "is_draft=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "$RELEASE_TAG 已公开发布，说明保持不动，只补附件"
+              echo "is_draft=false" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+
+  windows:
+    name: Windows installer
+    needs: prepare
+    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'windows'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/claude-mom/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: 安装前端依赖
+        working-directory: apps/claude-mom
+        run: npm ci
+
+      - name: 构建
+        working-directory: apps/claude-mom
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: npm run tauri -- build
+
+      - name: 收集附件
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          # 工作区根目录的 target/（Cargo workspace 在仓库根）。
+          src="target/release/bundle/nsis/ClaudeMom_${version}_x64-setup.exe"
+          for file in "$src" "$src.sig"; do
+            [ -s "$file" ] || { echo "缺少构建产物：$file" >&2; exit 1; }
+          done
+          mkdir -p dist
+          cp "$src" "$src.sig" dist/
+          ls -l dist
+
+      - name: 上传到 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+
+  macos:
+    name: macOS (universal)
+    needs: prepare
+    if: github.event_name == 'push' || inputs.platform == 'all' || inputs.platform == 'macos'
+    runs-on: macos-latest
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - uses: actions/setup-node@v4
         with:
@@ -63,7 +170,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
 
       - uses: Swatinem/rust-cache@v2
 
@@ -71,8 +178,7 @@ jobs:
         working-directory: apps/claude-mom
         run: npm ci
 
-      - name: macOS 签名身份（有 Secret 才启用）
-        if: matrix.platform == 'macos-latest'
+      - name: 签名与公证凭据
         shell: bash
         env:
           MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
@@ -82,40 +188,156 @@ jobs:
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
         run: |
-          if [ -n "$MACOS_CERT_P12" ] && [ -n "$MACOS_SIGNING_IDENTITY" ]; then
-            {
-              echo "APPLE_CERTIFICATE=$MACOS_CERT_P12"
-              echo "APPLE_CERTIFICATE_PASSWORD=$MACOS_CERT_PASSWORD"
-              echo "APPLE_SIGNING_IDENTITY=$MACOS_SIGNING_IDENTITY"
-            } >> "$GITHUB_ENV"
-            echo "使用正式签名：$MACOS_SIGNING_IDENTITY"
-          else
-            echo "没有签名 Secret：使用 ad-hoc 签名（首次打开需右键「打开」）"
+          set -euo pipefail
+          missing=""
+          for name in MACOS_CERT_P12 MACOS_CERT_PASSWORD MACOS_SIGNING_IDENTITY APPLE_API_KEY_P8 APPLE_API_KEY_ID APPLE_API_ISSUER_ID; do
+            [ -n "${!name:-}" ] || missing="$missing $name"
+          done
+          if [ -n "$missing" ]; then
+            echo "error: 签名 / 公证 Secret 不全（${missing# }），拒绝产出未签名或未公证的发布包" >&2
+            exit 1
           fi
-          if [ -n "$APPLE_API_KEY_P8" ] && [ -n "$APPLE_API_KEY_ID" ] && [ -n "$APPLE_API_ISSUER_ID" ]; then
-            key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
-            echo "$APPLE_API_KEY_P8" | base64 --decode > "$key"
-            {
-              echo "APPLE_API_KEY=$APPLE_API_KEY_ID"
-              echo "APPLE_API_ISSUER=$APPLE_API_ISSUER_ID"
-              echo "APPLE_API_KEY_PATH=$key"
-            } >> "$GITHUB_ENV"
-            echo "启用公证"
-          else
-            echo "公证 Secret 不全（APPLE_API_KEY_P8 / APPLE_API_KEY_ID / APPLE_API_ISSUER_ID）：只签名不公证"
-          fi
+          key="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY_ID}.p8"
+          echo "$APPLE_API_KEY_P8" | base64 --decode > "$key"
+          # Tauri CLI 读这些变量：导入证书到临时钥匙串、用该身份签名、提交公证并钉上票据。
+          {
+            echo "APPLE_CERTIFICATE=$MACOS_CERT_P12"
+            echo "APPLE_CERTIFICATE_PASSWORD=$MACOS_CERT_PASSWORD"
+            echo "APPLE_SIGNING_IDENTITY=$MACOS_SIGNING_IDENTITY"
+            echo "APPLE_API_KEY=$APPLE_API_KEY_ID"
+            echo "APPLE_API_ISSUER=$APPLE_API_ISSUER_ID"
+            echo "APPLE_API_KEY_PATH=$key"
+          } >> "$GITHUB_ENV"
 
-      - uses: tauri-apps/tauri-action@v0
+      - name: 构建
+        working-directory: apps/claude-mom
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          projectPath: apps/claude-mom
-          tagName: ${{ steps.meta.outputs.tag }}
-          releaseName: ClaudeMom ${{ steps.meta.outputs.version }}
-          releaseBody: ${{ steps.meta.outputs.notes }}
-          releaseDraft: false
-          prerelease: false
-          includeUpdaterJson: true
-          args: ${{ matrix.args }}
+        run: npm run tauri -- build --target universal-apple-darwin
+
+      - name: 校验签名与公证
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="target/universal-apple-darwin/release/bundle/macos/ClaudeMom.app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          # 能通过 Gatekeeper 评估说明已签名且公证过（ad-hoc 签名在这里会被拒）。
+          spctl --assess --type execute --verbose=2 "$app"
+
+      - name: 收集附件
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${RELEASE_TAG#v}"
+          bundle="target/universal-apple-darwin/release/bundle"
+          dmg="$bundle/dmg/ClaudeMom_${version}_universal.dmg"
+          tarball="$bundle/macos/ClaudeMom.app.tar.gz"
+          for file in "$dmg" "$tarball" "$tarball.sig"; do
+            [ -s "$file" ] || { echo "缺少构建产物：$file" >&2; exit 1; }
+          done
+          mkdir -p dist
+          # 更新包沿用之前的附件名（ClaudeMom_universal.app.tar.gz）。
+          cp "$dmg" dist/
+          cp "$tarball" dist/ClaudeMom_universal.app.tar.gz
+          cp "$tarball.sig" dist/ClaudeMom_universal.app.tar.gz.sig
+          ls -l dist
+
+      - name: 上传到 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: gh release upload "$RELEASE_TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+
+  latest-json:
+    name: Upload checksums, latest.json and publish
+    # 单平台补跑时另一个 job 会跳过；成功或跳过才允许更新元数据。
+    if: always() && needs.prepare.result == 'success' && (needs.windows.result == 'success' || needs.windows.result == 'skipped') && (needs.macos.result == 'success' || needs.macos.result == 'skipped')
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - windows
+      - macos
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Download release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 按 Release 上现有的全部附件重算，单平台补跑后也是完整清单。
+          gh release download "$RELEASE_TAG" --repo "$REPO" --pattern 'ClaudeMom*' --dir assets --clobber
+          ls -l assets
+
+      - name: Upload SHA256SUMS.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd assets && sha256sum ClaudeMom* | sort -k2 > ../SHA256SUMS.txt)
+          cat SHA256SUMS.txt
+          gh release upload "$RELEASE_TAG" SHA256SUMS.txt --clobber --repo "$REPO"
+
+      - name: Generate latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$REPO" --json body,tagName > release.json
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+          const release = JSON.parse(fs.readFileSync("release.json", "utf8"));
+          const repo = process.env.REPO;
+          const tag = release.tagName || process.env.RELEASE_TAG;
+          const version = tag.replace(/^v/i, "");
+          const windows = `ClaudeMom_${version}_x64-setup.exe`;
+          const mac = "ClaudeMom_universal.app.tar.gz";
+          const required = [windows, `${windows}.sig`, `ClaudeMom_${version}_universal.dmg`, mac, `${mac}.sig`];
+          for (const name of required) {
+            const file = path.join("assets", name);
+            if (!fs.existsSync(file) || fs.statSync(file).size === 0) throw new Error("发布附件缺失或为空：" + name);
+          }
+          const signature = (name) => fs.readFileSync(path.join("assets", `${name}.sig`), "utf8").trim();
+          // 草稿的地址是临时 untagged 链接，静态元数据必须用正式 tag 的下载地址。
+          const url = (name) => `https://github.com/${repo}/releases/download/${tag}/${encodeURIComponent(name)}`;
+          const win = { signature: signature(windows), url: url(windows) };
+          const darwin = { signature: signature(mac), url: url(mac) };
+          // Tauri updater 格式；平台键与 tauri-action 之前生成的保持一致。
+          const payload = {
+            version,
+            notes: release.body || "",
+            pub_date: new Date().toISOString(),
+            platforms: {
+              "windows-x86_64": win,
+              "windows-x86_64-nsis": win,
+              "darwin-aarch64": darwin,
+              "darwin-x86_64": darwin,
+              "darwin-aarch64-app": darwin,
+              "darwin-x86_64-app": darwin,
+            },
+          };
+          fs.writeFileSync("latest.json", `${JSON.stringify(payload, null, 2)}\n`);
+          NODE
+          cat latest.json
+
+      - name: Upload latest.json
+        shell: bash
+        run: gh release upload "$RELEASE_TAG" latest.json --clobber --repo "$REPO"
+
+      - name: Publish Release
+        # 推 tag 的发版自动发布；补跑只在勾了 publish 时发布。两个平台都得在这一轮成功。
+        if: needs.prepare.outputs.is_draft == 'true' && (github.event_name == 'push' || inputs.publish) && needs.windows.result == 'success' && needs.macos.result == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 只有版本最新时才标 Latest：补发的旧版本不能抢走 Latest，
+          # 否则「检查更新」读 releases/latest/download/latest.json 会回退到旧版。
+          published=$(gh release list --repo "$REPO" --exclude-drafts --exclude-pre-releases --limit 100 --json tagName -q '.[].tagName')
+          newest=$(printf '%s\n' "$RELEASE_TAG" $published | sed 's/^[vV]//' | sort -V | tail -n 1)
+          if [ "$newest" = "${RELEASE_TAG#[vV]}" ]; then
+            latest=true
+          else
+            latest=false
+            echo "::notice::已有更新的 v$newest，$RELEASE_TAG 发布但不标 Latest"
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --latest="$latest" --verify-tag --repo "$REPO"
